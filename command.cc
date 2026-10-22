@@ -34,13 +34,98 @@ void parse(std::vector<Token> &tokens)
     Command currentCommand;
     SimpleCommand *currentSimpleCommand = new SimpleCommand();
 
-    currentCommand.execute();
-    /*
-      Implement this function 
-      you must parse for all possible tokens scenario
-      right now command.execute only print the format , you will inject it in your logic.
+    for (size_t i = 0; i < tokens.size(); i++)
+    {
+        if (tokens[i].type == TOKEN_EOF)
+            break;
 
-    */
+        if (tokens[i].type == TOKEN_COMMAND || tokens[i].type == TOKEN_ARGUMENT)
+        {
+            currentSimpleCommand->insertArgument(strdup(tokens[i].value.c_str()));
+        }
+        else if (tokens[i].type == TOKEN_REDIRECT)
+        {
+            i++;
+	if (tokens[i].type != TOKEN_COMMAND && tokens[i].type != TOKEN_ARGUMENT)
+	{
+        printf("Error: missing file name after '>'\n");
+        return;
+	 }
+            currentCommand._outFile = strdup(tokens[i].value.c_str());
+        }
+	else if (tokens[i].type==TOKEN_INPUT)
+	{
+	i++;
+ 	if (tokens[i].type != TOKEN_COMMAND && tokens[i].type != TOKEN_ARGUMENT)
+        {
+        printf("Error: missing file name after '<'\n");
+        return;
+         }
+           
+	currentCommand._inputFile = strdup(tokens[i].value.c_str());
+	}
+	 else if (tokens[i].type==TOKEN_ERROR)
+        {
+        i++;
+	 if (tokens[i].type != TOKEN_COMMAND && tokens[i].type != TOKEN_ARGUMENT)
+        {
+        printf("Error: missing file name after '2>'\n");
+        return;
+         }
+           
+        currentCommand._errFile = strdup(tokens[i].value.c_str());
+        }
+	 else if (tokens[i].type==TOKEN_APPEND)
+        {
+        i++;
+	 if (tokens[i].type != TOKEN_COMMAND && tokens[i].type != TOKEN_ARGUMENT)
+        {
+        printf("Error: missing file name after '>>'\n");
+        return;
+         }
+           
+        currentCommand._outFile = strdup(tokens[i].value.c_str());
+	currentCommand._append = 1;
+        }
+	else if (tokens[i].type == TOKEN_BACKGROUND)
+	{
+    	currentCommand._background = 1;
+	}
+	else if (tokens[i].type == TOKEN_PIPE)
+	{
+	if (currentSimpleCommand->_numberOfArguments == 0)
+    {
+        printf("Error: missing command before '|'\n");
+        return;
+    }
+   	 currentCommand.insertSimpleCommand(currentSimpleCommand);
+    	 currentSimpleCommand = new SimpleCommand();
+	}
+	else if (tokens[i].type == TOKEN_REDIRECT_AND_ERROR)
+	{
+    	 i++;
+	 if (tokens[i].type != TOKEN_COMMAND && tokens[i].type != TOKEN_ARGUMENT)
+        {
+        printf("Error: missing file name after '>>&'\n");
+        return;
+         }
+           
+    	 currentCommand._outFile = strdup(tokens[i].value.c_str());
+    	 currentCommand._errFile= strdup(tokens[i].value.c_str());
+    	 currentCommand._append = 1;
+    	 currentCommand._out_error= 1;
+	}
+    }
+	if (tokens[0].type == TOKEN_EOF)     // <-- NEW: empty line
+        return;
+
+    if (currentSimpleCommand->_numberOfArguments == 0)   // <-- NEW: "ls |" or "> out.txt"
+    {
+        printf("Error: missing command\n");
+        return;
+    }
+    currentCommand.insertSimpleCommand(currentSimpleCommand);
+    currentCommand.execute();
 }
 
 SimpleCommand::SimpleCommand()
@@ -69,13 +154,15 @@ Command::Command()
 {
     _numberOfAvailableSimpleCommands = 1;
     _simpleCommands = (SimpleCommand **)
-        malloc(_numberOfSimpleCommands * sizeof(SimpleCommand *));
+        malloc(_numberOfAvailableSimpleCommands * sizeof(SimpleCommand *));
 
     _numberOfSimpleCommands = 0;
     _outFile = 0;
     _inputFile = 0;
     _errFile = 0;
     _background = 0;
+    _append = 0;
+    _out_error = 0;
 }
 
 void Command::insertSimpleCommand(SimpleCommand *simpleCommand)
@@ -124,6 +211,8 @@ void Command::clear()
     _inputFile = 0;
     _errFile = 0;
     _background = 0;
+    _append = 0;
+    _out_error = 0;
 }
 
 void Command::print()
@@ -141,6 +230,7 @@ void Command::print()
         {
             printf("\"%s\" \t", _simpleCommands[i]->_arguments[j]);
         }
+	printf("\n");
     }
 
     printf("\n\n");
@@ -155,22 +245,117 @@ void Command::print()
 void Command::execute()
 {
     print();
-    /*
-        Write your code here
-    */
+
+    int n = _numberOfSimpleCommands;
+    std::vector<int> pipes(2 * (n - 1));        // one pipe = 2 fds
+
+    for (int i = 0; i < n - 1; i++)
+    {
+        if (pipe(&pipes[2 * i]) < 0)
+        {
+            perror("pipe");
+            clear();
+            return;
+        }
+    }
+
+    pid_t pid = -1;
+    for (int i = 0; i < n; i++)
+    {
+        pid = fork();
+
+        if (pid < 0)
+        {
+            perror("fork");
+            break;
+        }
+        else if (pid == 0)                      // child 
+        {
+            
+            if (i > 0)
+                dup2(pipes[2 * (i - 1)], 0);
+            if (i < n - 1)
+                dup2(pipes[2 * i + 1], 1);
+
+            
+            if (_inputFile && i == 0)
+            {
+                int fdin = open(_inputFile, O_RDONLY);
+                if (fdin < 0)
+                {
+                    perror(_inputFile);
+                    _exit(1);
+                }
+                dup2(fdin, 0);
+                close(fdin);
+            }
+
+            if (_outFile && i == n - 1)
+            {
+                int flags = O_WRONLY | O_CREAT;
+                if (_append)
+                    flags |= O_APPEND;
+                else
+                    flags |= O_TRUNC;
+
+                int fd = open(_outFile, flags, 0644);
+                if (fd < 0)
+                {
+                    perror(_outFile);
+                    _exit(1);
+                }
+                dup2(fd, 1);
+                if (_out_error)               
+                    dup2(fd, 2);
+                close(fd);
+            }
+
+            if (_errFile && !_out_error && i == n - 1)
+            {
+                int fderr = open(_errFile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fderr < 0)
+                {
+                    perror(_errFile);
+                    _exit(1);
+                }
+                dup2(fderr, 2);
+                close(fderr);
+            }
+
+          
+            for (size_t k = 0; k < pipes.size(); k++)
+                close(pipes[k]);
+
+            execvp(_simpleCommands[i]->_arguments[0], _simpleCommands[i]->_arguments);
+            perror("execvp");
+            _exit(1);
+        }
+    }                                           
+
+    // parent
+    for (size_t k = 0; k < pipes.size(); k++)
+        close(pipes[k]);
+
+    if (_background == 0)
+        waitpid(pid, NULL, 0);
 
     clear();
-    prompt();
 }
 
 void Command::prompt()
 {
-    printf("myshell>");
-    fflush(stdout);
     std::string input;
     while (true)
     {
-        std::getline(std::cin, input); 
+        printf("myshell>");
+        fflush(stdout);
+
+        if (!std::getline(std::cin, input))   // Ctrl-D
+        {
+            printf("\n");
+            break;
+        }
+
         std::vector<Token> tokens = tokenize(input);
         parse(tokens);
     }
